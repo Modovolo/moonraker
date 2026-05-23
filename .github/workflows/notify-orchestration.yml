@@ -1,0 +1,102 @@
+name: Notify Fleet Orchestration
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      orchestration_repo:
+        description: Target orchestration repository
+        required: false
+        default: Modovolo/fleet-orchestration
+        type: string
+      apply:
+        description: Apply manifests in orchestration workflow
+        required: false
+        default: true
+        type: boolean
+      restart:
+        description: Restart deployments in orchestration workflow
+        required: false
+        default: true
+        type: boolean
+      update_lock:
+        description: Update orchestration lock ref to this SHA
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send repository dispatch
+        shell: bash
+        env:
+          DISPATCH_TOKEN: ${{ secrets[format('{0}', 'FLEET_ORCHESTRATION_TOKEN')] || github.token }}
+          COMPONENT: moonraker
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ORCHESTRATION_REPO: ${{ github.event.inputs.orchestration_repo }}
+          INPUT_APPLY: ${{ github.event.inputs.apply }}
+          INPUT_RESTART: ${{ github.event.inputs.restart }}
+          INPUT_UPDATE_LOCK: ${{ github.event.inputs.update_lock }}
+        run: |
+          set -euo pipefail
+
+          to_bool() {
+            local raw="${1:-}"
+            local default_val="${2:-false}"
+            local lowered
+            lowered="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+            case "$lowered" in
+              true|1|yes|y) echo "true" ;;
+              false|0|no|n) echo "false" ;;
+              *) echo "$default_val" ;;
+            esac
+          }
+
+          if [[ -z "$DISPATCH_TOKEN" ]]; then
+            echo "Missing dispatch token. Set FLEET_ORCHESTRATION_TOKEN or ensure GITHUB_TOKEN has cross-repo access."
+            exit 1
+          fi
+
+          ORCHESTRATION_REPO="$INPUT_ORCHESTRATION_REPO"
+          if [[ -z "$ORCHESTRATION_REPO" ]]; then
+            ORCHESTRATION_REPO="Modovolo/fleet-orchestration"
+          fi
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            APPLY="$(to_bool "$INPUT_APPLY" "true")"
+            RESTART="$(to_bool "$INPUT_RESTART" "true")"
+            UPDATE_LOCK="$(to_bool "$INPUT_UPDATE_LOCK" "false")"
+          else
+            APPLY="true"
+            RESTART="true"
+            UPDATE_LOCK="false"
+          fi
+
+          TAG="${SHA:0:12}"
+
+          PAYLOAD="$(jq -n \
+            --arg component "$COMPONENT" \
+            --arg repository "$REPOSITORY" \
+            --arg sha "$SHA" \
+            --arg ref "$REF" \
+            --arg tag "$TAG" \
+            --argjson apply "$APPLY" \
+            --argjson restart "$RESTART" \
+            --argjson update_lock "$UPDATE_LOCK" \
+            '{event_type: "fleet_component_changed", client_payload: {component: $component, repository: $repository, sha: $sha, ref: $ref, tag: $tag, apply: $apply, restart: $restart, update_lock: $update_lock}}')"
+
+          curl -fsSL -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            "https://api.github.com/repos/${ORCHESTRATION_REPO}/dispatches" \
+            -d "$PAYLOAD"
