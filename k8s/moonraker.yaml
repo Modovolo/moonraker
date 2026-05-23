@@ -1,0 +1,102 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: moonraker-data
+  namespace: fleet
+  labels:
+    app: moonraker
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: moonraker-config
+  namespace: fleet
+  labels:
+    app: moonraker
+data:
+  moonraker.conf: |
+    [server]
+    host: 0.0.0.0
+    port: 7125
+
+    [file_manager]
+    enable_object_processing: True
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: moonraker
+  namespace: fleet
+  labels:
+    app: moonraker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: moonraker
+  template:
+    metadata:
+      labels:
+        app: moonraker
+    spec:
+      imagePullSecrets:
+        - name: dockerhub-creds
+      containers:
+        - name: moonraker
+          image: jmarji/moonraker:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 7125
+              name: http
+          env:
+            - name: MOONRAKER_DATA_PATH
+              value: /printer_data
+            - name: MOONRAKER_CONFIG_PATH
+              value: /printer_data/config/moonraker.conf
+          volumeMounts:
+            - name: moonraker-data
+              mountPath: /printer_data
+            - name: moonraker-config
+              mountPath: /printer_data/config/moonraker.conf
+              subPath: moonraker.conf
+          readinessProbe:
+            tcpSocket:
+              port: 7125
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 7125
+            initialDelaySeconds: 30
+            periodSeconds: 20
+      volumes:
+        - name: moonraker-data
+          persistentVolumeClaim:
+            claimName: moonraker-data
+        - name: moonraker-config
+          configMap:
+            name: moonraker-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: moonraker
+  namespace: fleet
+  labels:
+    app: moonraker
+spec:
+  selector:
+    app: moonraker
+  ports:
+    - name: http
+      port: 7125
+      targetPort: 7125
+      protocol: TCP
+  type: ClusterIP
