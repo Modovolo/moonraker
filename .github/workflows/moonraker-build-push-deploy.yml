@@ -32,7 +32,7 @@ permissions:
 
 env:
   IMAGE_NAME: moonraker
-  DOCKER_CONTEXT: .
+  BUILD_CONTEXT: .
   DOCKERFILE_PATH: Dockerfile
   K8S_MANIFEST_PATH: k8s/moonraker.yaml
   DEPLOYMENT_NAME: moonraker
@@ -85,7 +85,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker build -f "$DOCKERFILE_PATH" -t "local/${IMAGE_NAME}:${{ steps.meta.outputs.image_tag }}" "$DOCKER_CONTEXT"
+          docker build -f "$DOCKERFILE_PATH" -t "local/${IMAGE_NAME}:${{ steps.meta.outputs.image_tag }}" "$BUILD_CONTEXT"
 
   push:
     runs-on: ubuntu-latest
@@ -102,13 +102,13 @@ jobs:
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: jmarji
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
-          context: ${{ env.DOCKER_CONTEXT }}
+          context: ${{ env.BUILD_CONTEXT }}
           file: ${{ env.DOCKERFILE_PATH }}
           push: true
           tags: ${{ needs.build.outputs.registry_namespace }}/${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
@@ -135,12 +135,22 @@ jobs:
       - name: Configure kubeconfig
         shell: bash
         env:
-          KUBECONFIG_B64: ${{ secrets.FLEET_KUBECONFIG_B64 }}
+          LKE_KUBECONFIG: ${{ secrets.LKE_KUBECONFIG }}
         run: |
           set -euo pipefail
-          test -n "$KUBECONFIG_B64"
+          if [[ -z "$LKE_KUBECONFIG" ]]; then
+            echo "Missing required secret: LKE_KUBECONFIG"
+            exit 1
+          fi
           mkdir -p "$HOME/.kube"
-          echo "$KUBECONFIG_B64" | base64 --decode > "$HOME/.kube/config"
+
+          if printf '%s' "$LKE_KUBECONFIG" | grep -q 'apiVersion:'; then
+            printf '%s\n' "$LKE_KUBECONFIG" > "$HOME/.kube/config"
+          elif ! printf '%s' "$LKE_KUBECONFIG" | base64 --decode > "$HOME/.kube/config" 2>/dev/null; then
+            echo "LKE_KUBECONFIG is neither raw kubeconfig nor valid base64"
+            exit 1
+          fi
+
           chmod 600 "$HOME/.kube/config"
 
       - name: Update image and deploy
@@ -148,6 +158,63 @@ jobs:
         run: |
           set -euo pipefail
           IMAGE_REF="${{ needs.push.outputs.image_ref }}"
-          sed -i "s|image: .*|image: ${IMAGE_REF}|g" "$K8S_MANIFEST_PATH"
+          NAMESPACE="${{ needs.build.outputs.deploy_namespace }}"
           kubectl apply -f "$K8S_MANIFEST_PATH"
-          kubectl rollout status "deployment/${DEPLOYMENT_NAME}" -n "${{ needs.build.outputs.deploy_namespace }}" --timeout=180s
+          kubectl set image "deployment/${DEPLOYMENT_NAME}" "${DEPLOYMENT_NAME}=${IMAGE_REF}" -n "$NAMESPACE"
+          kubectl rollout status "deployment/${DEPLOYMENT_NAME}" -n "$NAMESPACE" --timeout=180s
+
+          get_deployment_image() {
+            local deployment_name="$1"
+            local container_name="$2"
+            kubectl get deployment "$deployment_name" -n "$NAMESPACE" \
+              -o jsonpath="{.spec.template.spec.containers[?(@.name=='$container_name')].image}" 2>/dev/null || true
+          }
+
+          extract_image_hash() {
+            local image_ref="$1"
+
+            if [[ -z "$image_ref" ]]; then
+              echo "n/a"
+              return
+            fi
+
+            if [[ "$image_ref" == *"@"* ]]; then
+              local digest="${image_ref##*@}"
+              digest="${digest#sha256:}"
+              echo "${digest:0:12}"
+              return
+            fi
+
+            if [[ "$image_ref" == *":"* ]]; then
+              echo "${image_ref##*:}"
+              return
+            fi
+
+            echo "$image_ref"
+          }
+
+          FLEET_MANAGER_HASH="$(extract_image_hash "$(get_deployment_image fleet-manager fleet-manager)")"
+          MAINSAIL_HASH="$(extract_image_hash "$(get_deployment_image mainsail mainsail)")"
+          BFP_MONITOR_HASH="$(extract_image_hash "$(get_deployment_image bfp-print-monitor bfp-print-monitor)")"
+          MOONRAKER_HASH="$(extract_image_hash "$(get_deployment_image moonraker moonraker)")"
+
+          MAINSAIL_CONFIG_JSON="$(kubectl get configmap mainsail-config -n "$NAMESPACE" -o jsonpath='{.data.config\.json}' 2>/dev/null || true)"
+          if [[ -n "$MAINSAIL_CONFIG_JSON" ]]; then
+            UPDATED_MAINSAIL_CONFIG_JSON="$(printf '%s' "$MAINSAIL_CONFIG_JSON" | jq -c \
+              --arg fleetManager "$FLEET_MANAGER_HASH" \
+              --arg mainsail "$MAINSAIL_HASH" \
+              --arg bfpPrintMonitor "$BFP_MONITOR_HASH" \
+              --arg moonraker "$MOONRAKER_HASH" \
+              '.containerImageHashes = (.containerImageHashes // {})
+               | .containerImageHashes.fleetManager = $fleetManager
+               | .containerImageHashes.mainsail = $mainsail
+               | .containerImageHashes.bfpPrintMonitor = $bfpPrintMonitor
+               | .containerImageHashes.moonraker = $moonraker')"
+
+            PATCH_PAYLOAD="$(jq -cn --arg cfg "$UPDATED_MAINSAIL_CONFIG_JSON" '{data: {"config.json": $cfg}}')"
+            kubectl patch configmap mainsail-config -n "$NAMESPACE" --type merge -p "$PATCH_PAYLOAD"
+            kubectl rollout restart deployment/mainsail -n "$NAMESPACE" || true
+            kubectl rollout status deployment/mainsail -n "$NAMESPACE" --timeout=180s || true
+          else
+            echo "mainsail-config configmap not found; skipping hash sync"
+          fi
